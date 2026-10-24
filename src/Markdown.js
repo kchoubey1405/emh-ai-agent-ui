@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Check, Copy, FileCode } from "lucide-react";
 import { downloadFile } from "./api";
 
 /**
@@ -159,6 +160,245 @@ function parseBlocks(text) {
   return blocks;
 }
 
+function isDiffBlock(block) {
+  if (!block) return false;
+  const lang = (block.lang || "").toLowerCase();
+  if (lang === "diff" || lang === "patch" || lang === "udiff") return true;
+  const text = block.text || "";
+  if (text.startsWith("diff --git ") || text.includes("\ndiff --git ")) return true;
+  if (/^--- (?:a\/|\/dev\/null)/m.test(text) && /^\+\+\+ (?:b\/|\/dev\/null)/m.test(text)) return true;
+  if (/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m.test(text)) return true;
+  return false;
+}
+
+function parseDiff(text) {
+  const rawLines = String(text).replace(/\r\n/g, "\n").split("\n");
+  const files = [];
+  let currentFile = null;
+
+  function ensureFile(name) {
+    if (!currentFile || (name && currentFile.filePath !== name && currentFile.lines.length > 0)) {
+      currentFile = {
+        filePath: name || "Proposed changes",
+        rawText: "",
+        additions: 0,
+        deletions: 0,
+        lines: []
+      };
+      files.push(currentFile);
+    } else if (name && currentFile.filePath === "Proposed changes") {
+      currentFile.filePath = name;
+    }
+    return currentFile;
+  }
+
+  let oldLine = 1;
+  let newLine = 1;
+
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i];
+
+    // Detect diff --git a/path b/path
+    const gitMatch = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+    if (gitMatch) {
+      currentFile = {
+        filePath: gitMatch[2] || gitMatch[1],
+        rawText: line + "\n",
+        additions: 0,
+        deletions: 0,
+        lines: [{ type: "header", oldNum: null, newNum: null, prefix: " ", content: line }]
+      };
+      files.push(currentFile);
+      continue;
+    }
+
+    // Detect --- a/path or +++ b/path
+    const minusFileMatch = line.match(/^--- (?:a\/)?(.+)$/);
+    const plusFileMatch = line.match(/^\+\+\+ (?:b\/)?(.+)$/);
+
+    if (minusFileMatch && !line.startsWith("--- /dev/null")) {
+      ensureFile(minusFileMatch[1].replace(/^[ab]\//, ""));
+      currentFile.rawText += line + "\n";
+      currentFile.lines.push({ type: "header", oldNum: null, newNum: null, prefix: " ", content: line });
+      continue;
+    }
+
+    if (plusFileMatch && !line.startsWith("+++ /dev/null")) {
+      const fileName = plusFileMatch[1].replace(/^[ab]\//, "");
+      ensureFile(fileName);
+      currentFile.filePath = fileName;
+      currentFile.rawText += line + "\n";
+      currentFile.lines.push({ type: "header", oldNum: null, newNum: null, prefix: " ", content: line });
+      continue;
+    }
+
+    if (line.startsWith("index ") || line.startsWith("new file mode") || line.startsWith("deleted file mode")) {
+      const f = ensureFile();
+      f.rawText += line + "\n";
+      f.lines.push({ type: "header", oldNum: null, newNum: null, prefix: " ", content: line });
+      continue;
+    }
+
+    // Hunk header: @@ -10,3 +10,4 @@
+    const hunkMatch = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/);
+    if (hunkMatch) {
+      const f = ensureFile();
+      oldLine = parseInt(hunkMatch[1], 10);
+      newLine = parseInt(hunkMatch[3], 10);
+      f.rawText += line + "\n";
+      f.lines.push({
+        type: "hunk",
+        oldNum: null,
+        newNum: null,
+        prefix: "@",
+        content: line
+      });
+      continue;
+    }
+
+    const f = ensureFile();
+    f.rawText += line + "\n";
+
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      f.additions++;
+      f.lines.push({
+        type: "add",
+        oldNum: null,
+        newNum: newLine++,
+        prefix: "+",
+        content: line.slice(1)
+      });
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      f.deletions++;
+      f.lines.push({
+        type: "del",
+        oldNum: oldLine++,
+        newNum: null,
+        prefix: "-",
+        content: line.slice(1)
+      });
+    } else if (line.startsWith("\\")) {
+      f.lines.push({
+        type: "meta",
+        oldNum: null,
+        newNum: null,
+        prefix: " ",
+        content: line
+      });
+    } else {
+      const content = line.startsWith(" ") ? line.slice(1) : line;
+      f.lines.push({
+        type: "context",
+        oldNum: oldLine++,
+        newNum: newLine++,
+        prefix: " ",
+        content
+      });
+    }
+  }
+
+  return files.length > 0 ? files : [{
+    filePath: "Proposed Changes",
+    rawText: text,
+    additions: 0,
+    deletions: 0,
+    lines: rawLines.map((l) => ({
+      type: l.startsWith("+") ? "add" : l.startsWith("-") ? "del" : "context",
+      oldNum: null,
+      newNum: null,
+      prefix: l.startsWith("+") ? "+" : l.startsWith("-") ? "-" : " ",
+      content: (l.startsWith("+") || l.startsWith("-") || l.startsWith(" ")) ? l.slice(1) : l
+    }))
+  }];
+}
+
+function DiffFileCard({ file }) {
+  const [copied, setCopied] = useState(false);
+
+  function copyPatch() {
+    try {
+      navigator.clipboard.writeText(file.rawText || "");
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // ignore
+    }
+  }
+
+  return (
+    <div className="diff-file-card">
+      <div className="diff-file-header">
+        <div className="diff-file-info">
+          <FileCode size={15} className="diff-file-icon" />
+          <span className="diff-file-path">{file.filePath}</span>
+          <div className="diff-stats-badges">
+            {file.additions > 0 && <span className="diff-badge-add">+{file.additions}</span>}
+            {file.deletions > 0 && <span className="diff-badge-del">-{file.deletions}</span>}
+          </div>
+        </div>
+        <button type="button" className="diff-copy-btn" onClick={copyPatch} title="Copy file patch">
+          {copied ? <Check size={13} className="text-green" /> : <Copy size={13} />}
+          <span>{copied ? "Copied" : "Copy"}</span>
+        </button>
+      </div>
+
+      <div className="diff-table">
+        {file.lines.map((l, idx) => (
+          <div key={idx} className={`diff-row diff-row-${l.type}`}>
+            <span className="diff-num old-num">{l.oldNum ?? ""}</span>
+            <span className="diff-num new-num">{l.newNum ?? ""}</span>
+            <span className="diff-sign">{l.prefix || " "}</span>
+            <span className="diff-text">{l.content || " "}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DiffViewer({ rawText }) {
+  const [copiedAll, setCopiedAll] = useState(false);
+  const files = parseDiff(rawText);
+
+  const totalAdd = files.reduce((acc, f) => acc + f.additions, 0);
+  const totalDel = files.reduce((acc, f) => acc + f.deletions, 0);
+
+  function copyAll() {
+    try {
+      navigator.clipboard.writeText(rawText);
+      setCopiedAll(true);
+      setTimeout(() => setCopiedAll(false), 2000);
+    } catch {
+      // ignore
+    }
+  }
+
+  return (
+    <div className="diff-viewer">
+      <div className="diff-viewer-topbar">
+        <div className="diff-viewer-title-group">
+          <span className="diff-badge">DIFF</span>
+          <span className="diff-summary-text">
+            {files.length} file{files.length === 1 ? "" : "s"} changed
+            {totalAdd > 0 && <span className="diff-summary-add"> (+{totalAdd})</span>}
+            {totalDel > 0 && <span className="diff-summary-del"> (-{totalDel})</span>}
+          </span>
+        </div>
+        <button type="button" className="diff-copy-btn" onClick={copyAll} title="Copy full diff">
+          {copiedAll ? <Check size={13} className="text-green" /> : <Copy size={13} />}
+          <span>{copiedAll ? "Copied diff" : "Copy diff"}</span>
+        </button>
+      </div>
+
+      <div className="diff-files-list">
+        {files.map((file, idx) => (
+          <DiffFileCard key={idx} file={file} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function Markdown({ text }) {
   const blocks = parseBlocks(text || "");
 
@@ -172,28 +412,8 @@ export default function Markdown({ text }) {
             return <Tag key={key} className="md-heading">{renderInline(block.text, key)}</Tag>;
           }
           case "code": {
-            if (block.lang === "diff") {
-              const diffLines = block.text.split("\n");
-              return (
-                <div key={key} className="diff-viewer">
-                  <div className="diff-header">
-                    <span className="diff-badge">DIFF</span>
-                    <span className="diff-title">Proposed Code Changes</span>
-                  </div>
-                  <pre className="md-code diff-code">
-                    <code>
-                      {diffLines.map((dl, dIdx) => {
-                        let cls = "diff-line";
-                        if (dl.startsWith("+") && !dl.startsWith("+++")) cls += " diff-add";
-                        else if (dl.startsWith("-") && !dl.startsWith("---")) cls += " diff-del";
-                        else if (dl.startsWith("@@")) cls += " diff-hunk";
-                        else if (dl.startsWith("---") || dl.startsWith("+++")) cls += " diff-file";
-                        return <div key={dIdx} className={cls}>{dl || " "}</div>;
-                      })}
-                    </code>
-                  </pre>
-                </div>
-              );
+            if (isDiffBlock(block)) {
+              return <DiffViewer key={key} rawText={block.text} />;
             }
             return <pre key={key} className="md-code"><code>{block.text}</code></pre>;
           }
